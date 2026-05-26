@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import io
 import re
+import time
 from pathlib import Path
-from typing import Iterable, List
+from typing import List
 
 import pandas as pd
 import streamlit as st
@@ -32,6 +33,17 @@ def normalize_name(name: str) -> str:
     return cleaned
 
 
+def format_seconds(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, remaining = divmod(int(seconds), 60)
+    if minutes < 60:
+        return f"{minutes}m {remaining}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m {remaining}s"
+
+
 def read_search_names(text_input: str, uploaded_file) -> List[str]:
     names: List[str] = []
 
@@ -54,7 +66,6 @@ def read_search_names(text_input: str, uploaded_file) -> List[str]:
         )
         names.extend(file_names)
 
-    # Deduplicate while preserving order
     unique_names = list(dict.fromkeys(names))
     return unique_names
 
@@ -74,18 +85,30 @@ def classify_match(search_norm: str, candidate_norm: str) -> tuple[str, int]:
     return "Fuzzy", confidence
 
 
-def search_records(db_df: pd.DataFrame, search_names: Iterable[str], fuzzy_threshold: int = 70) -> pd.DataFrame:
+def search_records_with_progress(db_df: pd.DataFrame, search_names: List[str], fuzzy_threshold: int = 70) -> tuple[pd.DataFrame, dict]:
     records = []
+    valid_searches = [name for name in search_names if normalize_name(name)]
+    total_names = len(valid_searches)
 
-    for raw_name in search_names:
+    progress_bar = st.progress(0.0, text="Waiting to start search...")
+    status_text = st.empty()
+    metrics_text = st.empty()
+
+    if total_names == 0:
+        progress_bar.empty()
+        status_text.warning("No valid names to process after normalization.")
+        metrics_text.empty()
+        return pd.DataFrame(), {"total_time": 0.0, "total_names": 0, "total_matches": 0, "avg_time": 0.0}
+
+    db_records = db_df[["Name", "Jurisdiction", "Amount", "Date", "__normalized_name"]].to_dict("records")
+
+    start_time = time.perf_counter()
+
+    for i, raw_name in enumerate(valid_searches, start=1):
         search_norm = normalize_name(raw_name)
-        if not search_norm:
-            continue
 
-        for _, row in db_df.iterrows():
-            matched_name = str(row["Name"])
-            candidate_norm = row["__normalized_name"]
-            match_type, confidence = classify_match(search_norm, candidate_norm)
+        for row in db_records:
+            match_type, confidence = classify_match(search_norm, row["__normalized_name"])
 
             if match_type == "Fuzzy" and confidence < fuzzy_threshold:
                 continue
@@ -94,7 +117,7 @@ def search_records(db_df: pd.DataFrame, search_names: Iterable[str], fuzzy_thres
                 records.append(
                     {
                         "Search Name": raw_name,
-                        "Matched Name": matched_name,
+                        "Matched Name": str(row["Name"]),
                         "Jurisdiction": row["Jurisdiction"],
                         "Amount": row["Amount"],
                         "Date": row["Date"],
@@ -103,12 +126,47 @@ def search_records(db_df: pd.DataFrame, search_names: Iterable[str], fuzzy_thres
                     }
                 )
 
+        elapsed = time.perf_counter() - start_time
+        pct = i / total_names
+        avg_per_name = elapsed / i
+        eta = max(0.0, avg_per_name * (total_names - i))
+
+        progress_bar.progress(
+            pct,
+            text=(
+                f"{i}/{total_names} names processed "
+                f"({pct * 100:.1f}%) | Elapsed: {format_seconds(elapsed)} | ETA: {format_seconds(eta)}"
+            ),
+        )
+        status_text.info(f"Processing {i} of {total_names} names...")
+        metrics_text.caption(
+            f"Processed: {i} | Total: {total_names} | Complete: {pct * 100:.1f}% | "
+            f"Elapsed: {format_seconds(elapsed)} | ETA: {format_seconds(eta)}"
+        )
+
+    total_time = time.perf_counter() - start_time
+    total_matches = len(records)
+    avg_time = total_time / total_names if total_names else 0.0
+
+    status_text.success("Search complete.")
+    metrics_text.caption(
+        f"Completed {total_names}/{total_names} (100.0%) in {format_seconds(total_time)}. "
+        f"Total matches: {total_matches}."
+    )
+
     results_df = pd.DataFrame(records)
     if not results_df.empty:
         results_df = results_df.sort_values(
             by=["Search Name", "Confidence Score", "Match Type"], ascending=[True, False, True]
         ).reset_index(drop=True)
-    return results_df
+
+    summary = {
+        "total_time": total_time,
+        "total_names": total_names,
+        "total_matches": total_matches,
+        "avg_time": avg_time,
+    }
+    return results_df, summary
 
 
 def to_excel_bytes(df: pd.DataFrame) -> bytes:
@@ -163,7 +221,16 @@ def main() -> None:
                 st.warning("Enter names in the text box and/or upload a file with names in the first column.")
                 return
 
-            results_df = search_records(db_df, search_names, fuzzy_threshold=fuzzy_threshold)
+            with st.spinner("Searching records. Please wait..."):
+                results_df, summary = search_records_with_progress(
+                    db_df, search_names, fuzzy_threshold=fuzzy_threshold
+                )
+
+            st.subheader("Search Summary")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Total Search Time", format_seconds(summary["total_time"]))
+            c2.metric("Total Matches Found", f"{summary['total_matches']:,}")
+            c3.metric("Average Time per Search", format_seconds(summary["avg_time"]))
 
             if results_df.empty:
                 st.info("No matches found using the current threshold.")
