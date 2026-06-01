@@ -4,7 +4,7 @@ import io
 import re
 import time
 from pathlib import Path
-from typing import List
+from typing import Callable, List
 
 import pandas as pd
 import streamlit as st
@@ -14,6 +14,7 @@ DATABASE_PATH_DEFAULT = (
     r"C:\Users\rcgar\OneDrive\Unclaimed Property\Anderson\Municipality Databases\Municipality Database 2025.xlsx"
 )
 REQUIRED_COLUMNS = ["Jurisdiction", "Name", "Amount", "Date"]
+PROGRESS_UPDATE_INTERVAL_SECONDS = 0.2
 
 SUFFIX_PATTERN = re.compile(
     r"\b(LLC|INC|CO|CORP|CORPORATION|LP|LLP)\b\.?", re.IGNORECASE
@@ -85,10 +86,47 @@ def classify_match(search_norm: str, candidate_norm: str) -> tuple[str, int]:
     return "Fuzzy", confidence
 
 
-def search_records_with_progress(db_df: pd.DataFrame, search_names: List[str], fuzzy_threshold: int = 70) -> tuple[pd.DataFrame, dict]:
+def prepare_search_names(search_names: List[str]) -> List[tuple[str, str]]:
+    """Return raw and normalized search names, excluding values that normalize to empty."""
+    return [(name, normalized) for name in search_names if (normalized := normalize_name(name))]
+
+
+def update_search_progress(
+    progress_bar,
+    status_text,
+    metrics_text,
+    processed_names: int,
+    total_names: int,
+    elapsed: float,
+) -> None:
+    """Refresh Streamlit-native progress widgets for the current search batch."""
+    pct = processed_names / total_names if total_names else 0.0
+    avg_per_name = elapsed / processed_names if processed_names else 0.0
+    eta = max(0.0, avg_per_name * (total_names - processed_names))
+
+    progress_bar.progress(
+        pct,
+        text=(
+            f"{processed_names}/{total_names} names processed "
+            f"({pct * 100:.1f}%) | Elapsed: {format_seconds(elapsed)} | ETA: {format_seconds(eta)}"
+        ),
+    )
+    status_text.info(f"Processing {processed_names} of {total_names} names...")
+    metrics_text.caption(
+        f"Processed: {processed_names} | Total: {total_names} | Complete: {pct * 100:.1f}% | "
+        f"Elapsed: {format_seconds(elapsed)} | ETA: {format_seconds(eta)}"
+    )
+
+
+def search_records_with_progress(
+    db_df: pd.DataFrame,
+    search_names: List[str],
+    fuzzy_threshold: int = 70,
+    timer: Callable[[], float] = time.perf_counter,
+) -> tuple[pd.DataFrame, dict]:
     records = []
-    valid_searches = [name for name in search_names if normalize_name(name)]
-    total_names = len(valid_searches)
+    prepared_searches = prepare_search_names(search_names)
+    total_names = len(prepared_searches)
 
     progress_bar = st.progress(0.0, text="Waiting to start search...")
     status_text = st.empty()
@@ -102,11 +140,10 @@ def search_records_with_progress(db_df: pd.DataFrame, search_names: List[str], f
 
     db_records = db_df[["Name", "Jurisdiction", "Amount", "Date", "__normalized_name"]].to_dict("records")
 
-    start_time = time.perf_counter()
+    start_time = timer()
+    last_progress_elapsed = 0.0
 
-    for i, raw_name in enumerate(valid_searches, start=1):
-        search_norm = normalize_name(raw_name)
-
+    for i, (raw_name, search_norm) in enumerate(prepared_searches, start=1):
         for row in db_records:
             match_type, confidence = classify_match(search_norm, row["__normalized_name"])
 
@@ -126,28 +163,21 @@ def search_records_with_progress(db_df: pd.DataFrame, search_names: List[str], f
                     }
                 )
 
-        elapsed = time.perf_counter() - start_time
-        pct = i / total_names
-        avg_per_name = elapsed / i
-        eta = max(0.0, avg_per_name * (total_names - i))
-
-        progress_bar.progress(
-            pct,
-            text=(
-                f"{i}/{total_names} names processed "
-                f"({pct * 100:.1f}%) | Elapsed: {format_seconds(elapsed)} | ETA: {format_seconds(eta)}"
-            ),
+        elapsed = timer() - start_time
+        should_update_progress = (
+            i == 1
+            or i == total_names
+            or elapsed - last_progress_elapsed >= PROGRESS_UPDATE_INTERVAL_SECONDS
         )
-        status_text.info(f"Processing {i} of {total_names} names...")
-        metrics_text.caption(
-            f"Processed: {i} | Total: {total_names} | Complete: {pct * 100:.1f}% | "
-            f"Elapsed: {format_seconds(elapsed)} | ETA: {format_seconds(eta)}"
-        )
+        if should_update_progress:
+            update_search_progress(progress_bar, status_text, metrics_text, i, total_names, elapsed)
+            last_progress_elapsed = elapsed
 
-    total_time = time.perf_counter() - start_time
+    total_time = timer() - start_time
     total_matches = len(records)
     avg_time = total_time / total_names if total_names else 0.0
 
+    update_search_progress(progress_bar, status_text, metrics_text, total_names, total_names, total_time)
     status_text.success("Search complete.")
     metrics_text.caption(
         f"Completed {total_names}/{total_names} (100.0%) in {format_seconds(total_time)}. "
