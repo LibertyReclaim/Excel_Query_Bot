@@ -3,16 +3,12 @@ from __future__ import annotations
 import io
 import re
 import time
-from pathlib import Path
 from typing import Callable, List
 
 import pandas as pd
 import streamlit as st
 from rapidfuzz import fuzz
 
-DATABASE_PATH_DEFAULT = (
-    r"C:\Users\rcgar\OneDrive\Unclaimed Property\Anderson\Municipality Databases\Municipality Database 2025.xlsx"
-)
 REQUIRED_COLUMNS = ["Jurisdiction", "Name", "Amount", "Date"]
 PROGRESS_UPDATE_INTERVAL_SECONDS = 0.2
 
@@ -207,12 +203,21 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
-def load_database(path: str) -> pd.DataFrame:
-    db_path = Path(path)
-    if not db_path.exists():
-        raise FileNotFoundError(f"Database file not found at: {path}")
+def remember_database_upload(uploaded_database) -> None:
+    """Persist the selected database file in Streamlit session state."""
+    if uploaded_database is None:
+        return
 
-    df = pd.read_excel(db_path)
+    st.session_state["database_file_name"] = uploaded_database.name
+    st.session_state["database_file_bytes"] = uploaded_database.getvalue()
+
+
+def has_database_selected() -> bool:
+    return "database_file_bytes" in st.session_state
+
+
+def load_database(database_bytes: bytes) -> pd.DataFrame:
+    df = pd.read_excel(io.BytesIO(database_bytes))
     missing = [col for col in REQUIRED_COLUMNS if col not in df.columns]
     if missing:
         raise ValueError(f"Database is missing required columns: {', '.join(missing)}")
@@ -229,7 +234,18 @@ def main() -> None:
         "Search a municipality unclaimed-property Excel database using exact, partial, and fuzzy matching."
     )
 
-    db_path = st.text_input("Database path", value=DATABASE_PATH_DEFAULT)
+    uploaded_database = st.file_uploader(
+        "Select Database",
+        type=["xlsx", "xls"],
+        help="Upload the Excel database containing Jurisdiction, Name, Amount, and Date columns.",
+    )
+    remember_database_upload(uploaded_database)
+
+    if has_database_selected():
+        st.success(f"Database selected: {st.session_state['database_file_name']}")
+    else:
+        st.info("Please upload a database Excel file before searching.")
+
     fuzzy_threshold = st.slider("Minimum fuzzy confidence score", min_value=0, max_value=100, value=70)
 
     text_input = st.text_area(
@@ -244,7 +260,11 @@ def main() -> None:
 
     if st.button("Search", type="primary"):
         try:
-            db_df = load_database(db_path)
+            if not has_database_selected():
+                st.warning("Please upload a database Excel file before searching.")
+                return
+
+            db_df = load_database(st.session_state["database_file_bytes"])
             search_names = read_search_names(text_input, uploaded_file)
 
             if not search_names:
